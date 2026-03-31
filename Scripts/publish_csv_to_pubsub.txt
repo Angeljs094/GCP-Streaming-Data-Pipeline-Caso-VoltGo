@@ -1,0 +1,29 @@
+import csv, json, time, argparse
+from google.cloud import pubsub_v1
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--project", required=True)
+    p.add_argument("--topic", required=True, help="Topic name (without projects/.../topics)")
+    p.add_argument("--csv_path", required=True)
+    p.add_argument("--sleep_ms", type=int, default=120)
+    args = p.parse_args()
+
+    publisher = pubsub_v1.PublisherClient()
+    topic_path = publisher.topic_path(args.project, args.topic)
+
+    sent = 0
+    with open(args.csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            data = json.dumps(row).encode("utf-8")
+            publisher.publish(topic_path, data=data)
+            sent += 1
+            if sent % 50 == 0:
+                print(f"Enviados {sent} mensajes...")
+            time.sleep(args.sleep_ms / 1000.0)
+
+    print(f"✅ Listo. Total enviados: {sent}")
+
+if __name__ == "__main__":
+    main()

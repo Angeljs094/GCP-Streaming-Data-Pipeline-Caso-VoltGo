@@ -1,0 +1,7 @@
+--------------------- Ejecucion de Publish CSV -----------------------------
+python publish_csv_to_pubsub.py --project=proyectodmc-488102 --topic=project-dms-atjs-events --csv_path="C:\Users\angel\OneDrive\Escritorio\Proyecto_GCP\sample_scooter_events.csv" --sleep_ms=100
+
+
+--------------------- Ejecucion de Streaming Pipeline -----------------------------
+python streaming_pipeline.py --project=proyectodmc-488102 
+--input_subscription=projects/proyectodmc-488102/subscriptions/project-dms-atjs-events-sub --bq_table=proyectodmc-488102:project_dms_atjs_dataset.scooter_events --firestore_collection=scooter_events_raw --deadletter_topic=projects/proyectodmc-488102/topics/project-dms-atjs-deadletter --runner=DataflowRunner --region=us-central1 --temp_location=gs://project-dms-atjs-dataflow/tmp --staging_location=gs://project-dms-atjs-dataflow/staging --job_name=voltgo-scooter-stream-v16 --requirements_file=requirements.txt --service_account_email=241116726059-compute@developer.gserviceaccount.com

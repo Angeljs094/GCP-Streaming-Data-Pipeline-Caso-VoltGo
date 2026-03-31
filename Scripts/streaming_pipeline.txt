@@ -1,0 +1,143 @@
+import argparse, json, datetime
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions, SetupOptions, GoogleCloudOptions
+from google.cloud import firestore
+
+BQ_SCHEMA = {
+    "fields": [
+        {"name": "event_id", "type": "STRING", "mode": "REQUIRED"},
+        {"name": "event_ts", "type": "TIMESTAMP", "mode": "REQUIRED"},
+        {"name": "event_date", "type": "DATE", "mode": "REQUIRED"},
+        {"name": "scooter_id", "type": "STRING", "mode": "REQUIRED"},
+        {"name": "driver_id", "type": "STRING", "mode": "REQUIRED"},
+        {"name": "city", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "zone", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "battery_pct", "type": "INT64", "mode": "NULLABLE"},
+        {"name": "speed_kmh", "type": "FLOAT64", "mode": "NULLABLE"},
+        {"name": "temp_c", "type": "FLOAT64", "mode": "NULLABLE"},
+        {"name": "brake_health", "type": "FLOAT64", "mode": "NULLABLE"},
+        {"name": "lat", "type": "FLOAT64", "mode": "NULLABLE"},
+        {"name": "lon", "type": "FLOAT64", "mode": "NULLABLE"},
+        {"name": "event_type", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "alert_code", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "ingest_source", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "ingest_ts", "type": "TIMESTAMP", "mode": "REQUIRED"},
+    ]
+}
+
+REQUIRED_FIELDS = ["event_id", "event_ts", "event_date", "scooter_id", "driver_id"]
+
+def parse_and_validate(msg_bytes: bytes):
+    """Return (is_valid, payload_dict)."""
+    try:
+        obj = json.loads(msg_bytes.decode("utf-8"))
+    except Exception as e:
+        return False, {"error": f"invalid_json: {e}", "raw": msg_bytes.decode("utf-8", errors="replace")}
+
+    missing = [k for k in REQUIRED_FIELDS if not obj.get(k)]
+    if missing:
+        return False, {"error": f"missing_fields: {missing}", "raw": obj}
+
+    def to_int(x):
+        try:
+            return int(x) if x not in (None, "") else None
+        except:
+            return None
+
+    def to_float(x):
+        try:
+            return float(x) if x not in (None, "") else None
+        except:
+            return None
+
+    obj["battery_pct"] = to_int(obj.get("battery_pct"))
+    obj["speed_kmh"] = to_float(obj.get("speed_kmh"))
+    obj["temp_c"] = to_float(obj.get("temp_c"))
+    obj["brake_health"] = to_float(obj.get("brake_health"))
+    obj["lat"] = to_float(obj.get("lat"))
+    obj["lon"] = to_float(obj.get("lon"))
+
+    obj["ingest_source"] = obj.get("ingest_source") or "pubsub"
+    obj["ingest_ts"] = datetime.datetime.utcnow().isoformat() + "Z"
+
+    if obj["battery_pct"] is not None and not (0 <= obj["battery_pct"] <= 100):
+        return False, {"error": "battery_pct_out_of_range", "raw": obj}
+
+    return True, obj
+
+class WriteToFirestoreDoFn(beam.DoFn):
+    def __init__(self, project: str, collection: str):
+        self.project = project
+        self.collection = collection
+        self.client = None
+
+    def setup(self):
+        self.client = firestore.Client(project=self.project)
+
+    def process(self, element):
+        doc_id = element["event_id"]
+        self.client.collection(self.collection).document(doc_id).set(element, merge=True)
+        yield element
+
+def run(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--input_subscription", required=True, help="projects/<p>/subscriptions/<sub>")
+    parser.add_argument("--firestore_collection", default="scooter_events_raw")
+    parser.add_argument("--bq_table", required=True, help="<project>:<dataset>.<table>")
+    parser.add_argument("--deadletter_topic", required=False, help="projects/<p>/topics/<deadletter> (optional)")
+    known_args, pipeline_args = parser.parse_known_args(argv)
+
+
+
+    pipeline_options = PipelineOptions(pipeline_args, save_main_session=True, streaming=True)
+
+    google_cloud_options = pipeline_options.view_as(GoogleCloudOptions)
+    google_cloud_options.project = known_args.project
+    google_cloud_options.region = "us-central1"
+    google_cloud_options.job_name = "voltgo-scooter-stream"
+    google_cloud_options.staging_location = "gs://project-dms-atjs-dataflow/staging"
+    google_cloud_options.temp_location = "gs://project-dms-atjs-dataflow/tmp"
+
+    pipeline_options.view_as(StandardOptions).streaming = True
+    pipeline_options.view_as(SetupOptions).save_main_session = True
+
+
+    with beam.Pipeline(options=pipeline_options) as p:
+        messages = p | "ReadPubSub" >> beam.io.ReadFromPubSub(subscription=known_args.input_subscription)
+
+        parsed = messages | "ParseValidate" >> beam.Map(parse_and_validate)
+
+        valid = (
+            parsed
+            | "FilterValid" >> beam.Filter(lambda t: t[0] is True)
+            | "DropFlag" >> beam.Map(lambda t: t[1])
+        )
+
+        invalid = (
+            parsed
+            | "FilterInvalid" >> beam.Filter(lambda t: t[0] is False)
+            | "DropFlagInv" >> beam.Map(lambda t: t[1])
+        )
+
+        after_fs = valid | "WriteFirestore" >> beam.ParDo(
+            WriteToFirestoreDoFn(project=known_args.project, collection=known_args.firestore_collection)
+        )
+
+        _ = after_fs | "WriteBigQuery" >> beam.io.WriteToBigQuery(
+            table=known_args.bq_table,
+            schema=BQ_SCHEMA,
+            create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED,
+            write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND,
+            method=beam.io.WriteToBigQuery.Method.STREAMING_INSERTS,
+        )
+
+        if known_args.deadletter_topic:
+            _ = (
+                invalid
+                | "InvalidToJson" >> beam.Map(lambda d: json.dumps(d).encode("utf-8"))
+                | "WriteDeadletter" >> beam.io.WriteToPubSub(topic=known_args.deadletter_topic)
+            )
+
+if __name__ == "__main__":
+    run()

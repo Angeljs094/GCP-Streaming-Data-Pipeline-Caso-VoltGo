@@ -1,0 +1,13 @@
+# Entornos virtuales
+venv311/
+venv/
+env/
+
+# Archivos compilados y temporales
+__pycache__/
+*.pyc
+
+# Archivos pesados o personales
+*.rar
+*.zip
+*.docx
